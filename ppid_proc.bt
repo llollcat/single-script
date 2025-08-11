@@ -1,0 +1,16 @@
+#!./bpftrace
+
+BEGIN
+{
+    printf("%-16s %-7s %-7s %-3s %s\n", "PCOMM", "PID", "PPID", "RET", "ARGS");
+}
+
+tracepoint:syscalls:sys_enter_exec*
+{
+    $ppid = (uint32)curtask->real_parent->pid;
+
+    if (args->filename != 0 && $ppid != pid) {
+        printf("%-16s %-7d %-7d %-3s ", comm, pid, $ppid, "NA");
+        join(args->argv);
+    }
+}
