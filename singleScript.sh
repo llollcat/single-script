@@ -1,236 +1,250 @@
 #!/bin/bash
 
-#source: https://gitlab.lab.local/lazin-mp/single-script-linux
+set -Euo pipefail
+shopt -s nullglob
 
-source ./checker.sh
-METRICS_DIR="./metric"
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-TCPDUMP_SAVE_NAME="${METRICS_DIR}/cap_${TIMESTAMP}.pcap"
-CALCULATE_HASHES=true
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+cd "$SCRIPT_DIR" || exit 1
 
-# Массив соответствия утилиты и имени bpftrace
-declare -a BPF_SCRIPTS=(
-	"capable.bt:Trace_security_capability_checks.txt"
-	"execsnoop.bt:Trace_new_processes_via_exec_syscalls.txt"
-	"tcpaccept.bt:Trace_TCP_passive_connections_accept.txt"
-	"tcpconnect.bt:Trace_TCP_active_connections_connect.txt"
-	"bashreadline.bt:Trace_Print_entered_bash_commands_system_wid.txt"
-	"opensnoop.bt:Trace_open_syscalls_filename.txt"
-	"setuids.bt:Trace_setuid_syscall.txt"
-	"threadsnoop.bt:Trace_New_thread_creation.txt"
-	"killsnoop.bt:Trace_killsnoop.txt"
-	"gethostlatency.bt:Trace_hostlatensy.txt"
-	"ppid_proc.bt:Trace_new_processes_via_exec_syscalls_for_tree.txt"
+METRICS_DIR="$PWD"
+MODULES_DIR="$PWD/modules"
+
+declare -a holidays=(
+    "01-01"
+    "01-07"
+    "02-23"
+    "03-08"
+    "05-01"
+    "05-09"
+    "06-12"
+    "11-04"
 )
 
-function run_checker() {
-	local name=$1
-	checker_name="${METRICS_DIR}/${name}_$(date +"%Y%m%d_%H%M%S").txt"
-	touch "$checker_name"
-	call_each2 > "$checker_name"
-	if [[ "$CALCULATE_HASHES" == "true" ]]; then
-		echo "Считаем хеши..."
-		generate_md5sum_baseline > "$checker_name"
-	fi
+is_holiday() {
+    local today=$(date +%m-%d)
+    for d in "${holidays[@]}"; do
+        [[ "$d" == "$today" ]] && return 0
+    done
+    return 1
 }
 
-function change_date() {
-	declare -a holidays=(
-		"01-01"
-		"01-07"
-		"02-23"
-		"03-08"
-		"05-01"
-		"05-09"
-		"06-12"
-		"11-04" 
-	)
-
-	current_date=$(date +%m-%d)
-	current_year=$(date +%Y)
-	current_time=$(date +%H:%M:%S)
-
-	# Проверка, является ли текущая дата праздничной
-	for holiday in "${holidays[@]}"; do
-		if [[ "$holiday" == "$current_date" ]]; then
-			echo "Сегодня уже праздничная дата ($holiday), смена даты не требуется."
-			return 0
-		fi
-	done
-
-	nearest_holiday=""
-	nearest_diff=366
-	nearest_date=""
-
-	for holiday in "${holidays[@]}"; do
-		if [[ "$holiday" > "$current_date" ]]; then
-			diff=$(( $(date -d "$current_year-$holiday" +%s) - $(date -d "$current_year-$current_date" +%s) ))
-			diff=$(( diff / 86400 ))
-
-			if (( diff < nearest_diff )); then
-				nearest_diff=$diff
-				nearest_holiday=$holiday
-				nearest_date="$current_year-$holiday $current_time"
-			fi
-		fi
-	done
-
-	if [[ -z "$nearest_holiday" ]]; then
-		next_year=$((current_year + 1))
-		nearest_holiday=${holidays[0]}
-		nearest_date="$next_year-$nearest_holiday $current_time"
-	fi
-
-	# Отключаем NTP перед установкой времени
-	if ! sudo timedatectl set-ntp false; then
-		echo "Не удалось отключить синхронизацию времени через NTP (timedatectl)."
-		exit 1
-	fi
-
-	# Установка системного времени
-	if ! sudo date -s "$nearest_date" >/dev/null 2>&1; then
-		echo "Ошибка при обновлении системного времени."
-		exit 1
-	fi
-
-	# Синхронизация аппаратного времени
-	if ! sudo hwclock --systohc >/dev/null 2>&1; then
-		echo "Ошибка при синхронизации аппаратного времени."
-		exit 1
-	fi
-
-	system_time=$(date +'%Y-%m-%d %H:%M:%S')
-	hardware_time=$(sudo hwclock --show | awk '{print $1 " " $2}')
-
-	echo "Системное время установлено: $system_time"
-	echo "Аппаратное время: $hardware_time"
-
-	TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-	TCPDUMP_SAVE_NAME="${METRICS_DIR}/cap_${TIMESTAMP}.pcap"
+create_metric_folder() {
+    local base="$1"
+    local dir="$SCRIPT_DIR/$base"
+    local i=0
+    while :; do
+        local candidate="${dir}${i:+$i}"
+        if [ ! -d "$candidate" ] || [ -z "$(find "$candidate" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+            mkdir -p "$candidate"
+            METRICS_DIR="$candidate"
+            break
+        fi
+        i=$((i+1))
+    done
+    chmod 777 "$METRICS_DIR"
 }
 
 
+print_logo() {
+  cat <<'EOF'
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▒▓▓█▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▒▓▓▓███▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓███▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓██▓▓▓▓▓▓▓▓▓▒▒▒▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▒▒▒▒▒▒▓▓█▓▓▓▓▓▓▓▒▒▒▒▓▓   ▒▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓█▓▓▒▒▒▒▒▒▒▓▓▓█▒▒▒▒▒▒▒▒▒▒▒▓▒  ░ ░▓▓▒▒▒▒▒▒▒▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▒▓▓▓▓▒▒▒▒▓▓▓▓█▓▒▒▒▒▒▒▒▒▒▒▓▓▓  ░▒ ░▓▓▒▒▒▒▒▒▒▓▓▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▓▓░▒▒▓▒░░▒ ░▓▓▒▒▒▒▓▓▓█▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▓▓▒   ░▒▓▓▓░▒█▒▒▓▓▒▒▓▓▓▓▓▓▓▓▒▒▒▒▒▒
+▒▒▒▒▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓█▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▒░   ▒▓▓▒█▓▓▓▓▒░░░█▓▒▒▒▒▒▒▒▒▒▒
+▒▒▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▒▒▒▓▓░░░░░▒▓▒▓█▓▒▒▒▒▒▒▒▒▒▒
+▒▒▓█▓▓▒▒▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▓▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▒█▓░░░░░░▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▓█▓█▓▓▓▒▒▒▒▒▓▓▓▓▓▓▓▓▓▒▒▒▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒█▓▓▓▓▒▒▒▒▒▒▓▓▒▓█▓░▒▓▓▒░░▒▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒
+▒▒▒▓▓▓█▓▓█▓▓▓▒▒▒▒▒▓▓▓▒▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▓█▓▒▓▓▒▒▒▒▓█▓░░▒▓█▓░▒▒▓█▓▒▓▒░░░▒▒▓▓▓▒▒▒▒▒
+▒▒▒▒▒▒▓▓▓▓█▓█▓▓▓▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▒▒▒▒▒▒▓█▓▒▒▓▓▒▒▓▓▒▓▓▒░░▒▓█▓▒▓█▓ ░▓▓▒▒▒░ ░▒▓▓▓▒▒
+▒▓▓▓▓▓▓▓▓▓▓▓▓▒▓██▓▓▓▒▒▒▒▒▓▓▒▒▒▒▓▓▒▓▓▓▓▓▓▓▓▓▓▒▒▓▓▒▒█▓▒░▒▓█▓░░▒▓█▓▒▓▒  ░▓▒ ░░   ░▓▓▒
+▒▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▓▒▒▓▓▒▒▓▒▒▒▒▓▓▒▒▒▒▒▓█▓▒▒▓██▓▒░▒▓█▓▓▓▓▒▒▒▓▒   ▓▓▒░░░░▒▓▓▒
+▒▒▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▒▒▒▒▒▒▒▒▒▓▓▓▒▒▓█▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▓▓▒░▒█▓▓▓▓▓▓▒▒▒
+▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▓▓▒▒▒▒▒▒▒▓▓▒▒▒▒▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓█▓▒▒▒▓█▓▓▓▓▓▓▓▓█▓▓▓▒▓██▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓█▓█▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▒▒▒▒▒▒▓▒▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓█▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▓█▓▒▒▒▓▓▓▒▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▒▓▓▒▒▒▒▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▓█▒▒▒▒▓▓░ ▒█▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓█░ ░█▓▒▒▒▓█▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▓█▓▒▒▒▒▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▒▒▒▒▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▓█▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
 
-function run_tcpdump() {
-	sudo killall tcpdump 2>/dev/null
-	sudo rm -rf $TCPDUMP_SAVE_NAME
-	
-	touch "$TCPDUMP_SAVE_NAME"
-	chmod 777 "$TCPDUMP_SAVE_NAME"
-	sudo nohup tcpdump -w "$TCPDUMP_SAVE_NAME" >/dev/null 2>&1 &
-}
-
-function end_metric() {
-	sudo pkill -f bpftrace 2>/dev/null
-	sudo killall tcpdump 2>/dev/null
-
-}
-
-function run_bpftrace() {
-	killall bpftrace 2>/dev/null || true
-	for entry in "${BPF_SCRIPTS[@]}"; do
-		IFS=':' read -r script output <<< "$entry"
-		nohup "./$script" -f 'text' -B 'full' -o "$METRICS_DIR/$output" >/dev/null 2>&1 &
-	done
-}
-
-
-function clear_bpf() {
-	declare -a files=(
-		"Trace_open_syscalls_filename.txt"
-		"Trace_new_processes_via_exec_syscalls_for_tree.txt"
-		"Trace_security_capability_checks.txt"
-	)
-
-	declare -a patterns=("bpftrace" "tuned" "pgrep" "ppid_proc")
-
-	for file in "${files[@]}"; do
-		path="$METRICS_DIR/$file"
-		if [[ -f "$path" ]]; then
-			for pattern in "${patterns[@]}"; do
-				sed -i "/$pattern/d" "$path"
-			done
-		fi
-	done
+EOF
 }
 
 
-function show_menu() {
-	echo "Считать хеши?: $CALCULATE_HASHES"
-	echo "Выберите действие:"
-	echo "1) Снятие Before, Live, After с помощью bpf"
-	echo "2) Снятие Before, Live, After на праздничную дату с помощью bpf"
-	echo "3) Снятие только Live, After с помощью bpf"
-	echo "4) Снятие только After"
-	echo "5) Включить/выключить снятие хешей"
-	echo "0) Выход"
+run_modules_func() {
+    local func="$1"
+    
+    for mod in $MODULES_DIR/*/sinsmod.sh; do
+        [[ -f "$mod" ]] || continue
+        (
+            pushd "$(dirname "$mod")" >/dev/null
+            unset -f $func
+            source "$mod"
+            if declare -F "$func" > /dev/null; then
+                $func
+            fi
+            popd >/dev/null
+        )
+    done
 }
 
-function main() {
-	echo "Проблемы/предложения: https://gitlab.lab.local/lazin-mp/single-script-linux/-/issues"
-	if [[ "$EUID" -ne 0 ]]; then
-		echo "Пожалуйста, запустите скрипт от имени root (sudo)."
-		exit 1
-	fi
-
-
-	chmod 777 ./*
-	
-	while true; do
-		show_menu
-		read -p "Введите номер: " choice
-		
-		case $choice in
-			2) 
-				echo "Меняем дату:"
-				change_date;&
-			1)	
-				if [ -d "$METRICS_DIR" ]; then
-					read -p "Папка $METRICS_DIR уже существует, удалить? y/n " is_delete
-					lower_is_delete=$(echo "$is_delete" | tr '[:upper:]' '[:lower:]')  # Переводим в lowercase
-					if [ "$lower_is_delete" = "y" ]; then
-						sudo rm -rf "$METRICS_DIR"
-					else
-						echo "Не удаляем, выходим."
-						exit 0
-					fi
-				fi
-				
-				mkdir -p "$METRICS_DIR"
-				chmod 777 --recursive $METRICS_DIR
-				echo "Снятие Before:"
-				run_checker "Before"
-				# pause
-				read -n 1 -s -r -p "Для начала снятия Live нажмите Enter:"
-				echo ""
-				echo "Live запущен...";&
-			3)	
-				mkdir -p "$METRICS_DIR"
-				chmod 777 --recursive $METRICS_DIR
-
-				run_bpftrace
-				run_tcpdump
-				# pause
-				read -n 1 -s -r -p "Для окончания снятия Live нажмите Enter:"
-				echo ""
-				end_metric
-				clear_bpf;&
-
-			4)					
-				mkdir -p "$METRICS_DIR"
-				chmod 777 --recursive $METRICS_DIR
-				echo "Снимаем After:"
-				run_checker "After"
-				echo "Снятие метрик завершено!"
-				chmod 777 --recursive $METRICS_DIR;;
-			5) 
-				((CALCULATE_HASHES=!CALCULATE_HASHES));;
-
-			0) exit 0;;
-			*) echo "Неверный выбор, попробуйте снова.";;
-		esac
-		echo ""
-	done
+pause() {
+    local message="$1"
+    while read -r -t 0; do :; done
+    read -n 1 -s -p "${message}"
+    echo
 }
 
-main
+spinner() {
+    local pid=$1
+    local chars='|/-\'
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%c" "${chars:i++%${#chars}:1}"
+        sleep 0.1
+    done
+    printf "\r"
+}
+
+snapshot_namespace() {
+    declare -F | awk '{print $3}'
+}
+
+restore_namespace() {
+    local before=("$@")
+    local after
+    mapfile -t after < <(declare -F | awk '{print $3}')
+    for f in "${after[@]}"; do
+        [[ " ${before[*]} " == *" $f "* ]] || unset -f "$f"
+    done
+}
+
+main() {
+    
+    NO_TMUX=0
+    for arg in "$@"; do
+        case "$arg" in
+            --no-tmux)
+                NO_TMUX=1
+            ;;
+        esac
+    done
+    
+    if [ -z "${STDBUF_APPLIED:-}" ]; then
+        export STDBUF_APPLIED=1
+        exec stdbuf -oL -eL "$0" "$@"
+    fi
+    
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "Запрос повышения прав..."
+        sudo "$0" "$@"
+        exit $?
+    fi
+    
+    if [[ "$NO_TMUX" -eq 0 && -z "${TMUX:-}" ]]; then
+        if command -v tmux &> /dev/null; then
+            tmux new-session -A -s sins "$0"
+            exit $?
+        else
+            echo "tmux не установлен, пробуем установить."
+            sudo apt update
+            sudo apt install tmux -y
+            if [[ $? -eq 0 ]]; then
+                tmux new-session -A -s sins "$0"
+                exit $?
+            else
+                echo "tmux не удалось установить, запуск без tmux."
+            fi
+        fi
+    fi
+    
+    if is_holiday; then
+        create_metric_folder "metric_holiday"
+    else
+        create_metric_folder "metric"
+    fi
+    
+    chmod -R 777 $MODULES_DIR/*
+    
+    # on_init всех модулей
+    for mod in $MODULES_DIR/*/sinsmod.sh; do
+        [[ -f "$mod" ]] || continue
+        pushd "$(dirname "$mod")" >/dev/null
+        before=$(snapshot_namespace)
+        source "$mod"
+        if declare -F "on_init" > /dev/null; then
+            on_init
+            if [[ $? -eq 3 ]]; then
+                pause "================= Ошибки, завершение работы ================="
+                exit 3
+            fi
+        fi
+        restore_namespace $before
+        popd >/dev/null
+    done
+    
+    print_logo
+    
+    stty sane
+    stty erase ^H
+    
+    CHOICE=-1
+    while true; do
+        menu_action=()
+        function_path=()
+        menu_item_number=1
+        for mod in $MODULES_DIR/*/sinsmod.sh; do
+            [[ -f "$mod" ]] || continue
+            before=$(snapshot_namespace)
+            unset MENU_ITEMS
+            source "$mod"
+            if [[ -v MENU_ITEMS ]]; then
+                for ((i=0; i<${#MENU_ITEMS[@]}; ++i)); do
+                    menu_action+=("$menu_item_number")
+                    menu_action+=("${MENU_ITEMS[i]}")
+                    function_path+=("$menu_item_number")
+                    function_path+=("$mod")
+                    ((++menu_item_number))
+                done
+                unset MENU_ITEMS
+            fi
+            restore_namespace $before
+        done
+        
+        echo ""
+        echo "================= Меню ================="
+        if ! [ -z "$CHOICE" ]; then
+            for ((i=0; i<${#menu_action[@]}; i+=2)); do
+                [[ $((i+1)) -lt ${#menu_action[@]} ]] && echo "${menu_action[i]}: ${menu_action[i+1]}"
+            done
+        fi
+        
+        read -p "Выберите опцию: " CHOICE
+        [[ -z "$CHOICE" ]] && echo "Ничего не выбрано, попробуйте снова." && continue
+        [[ "$CHOICE" -eq 0 ]] && echo "Завершение..." && exit 0
+        
+        menu_item_num=$(( (CHOICE-1)*2 + 1 ))
+        pushd "$(dirname "${function_path[menu_item_num]}")" >/dev/null
+        before=$(snapshot_namespace)
+        unset -f on_menu
+        source "${function_path[menu_item_num]}"
+        on_menu "${menu_action[menu_item_num]}"
+        restore_namespace $before
+        popd >/dev/null
+    done
+}
+
+main "$@"

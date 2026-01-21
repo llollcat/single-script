@@ -1,0 +1,3 @@
+#!/bin/sh
+
+echo "Компонент bpftrace не найден, скачайте его самостоятельно и замените этот файл на одноимённый https://github.com/bpftrace/bpftrace/releases"
